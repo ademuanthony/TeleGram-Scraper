@@ -127,8 +127,17 @@ def savePendingNewAccount(userId, data):
     with open(filePath, "w") as book:
         json.dump(data, book, indent=2)
 
+def ensurePaths(userId):
+    path = f"data/{userId}"
+    if os.path.exists(path) == False:
+        os.makedirs(path)
+    
+    path = f"data/members"
+    if os.path.exists(path) == False:
+        os.makedirs(path)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensurePaths(update.message.from_user.id)
     msg = """
     Welcome to Atakoya!
 
