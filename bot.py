@@ -9,11 +9,13 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import filters, ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes
 from telethon.sync import TelegramClient
 from telethon.tl.functions.messages import GetDialogsRequest
-from telethon.tl.types import InputPeerEmpty
+from telethon.tl.types import InputPeerEmpty, InputPeerUser
+from telethon.errors.rpcerrorlist import PeerFloodError
 
 re = "\033[1;31m"
 gr = "\033[1;32m"
 cy = "\033[1;36m"
+SLEEP_TIME = 30
 
 load_dotenv()
 
@@ -30,6 +32,9 @@ class Operation(enum.Enum):
     SessionCode = 4
     ViewGroup_send_code_request = 5
     ChooseGroup_to_scrap = 6
+    ChooseGroup_to_send_sms = 7
+    EnterMessage = 8
+    SendSMS_send_code_request = 9
 
 
 def readJsonFile(filePath):
@@ -92,12 +97,22 @@ def getPhoneCodeHash(userId):
     with open(filePath, encoding='UTF8') as f:
         return f.read()
 
-
 def savePhoneCodeHash(userId, code):
     filePath = f"data/{userId}/phoneCodeHash.txt"
     with open(filePath, 'w') as f:
         f.write(code)
 
+def saveCurrentMsgFileName(userId, fileName):
+    filePath = f"data/{userId}/saveCurrentMsgFileName.txt"
+    with open(filePath, 'w') as f:
+        f.write(fileName)
+
+def getCurrentMsgFileName(userId):
+    filePath = f"data/{userId}/saveCurrentMsgFileName.txt"
+    if os.path.exists(filePath) is False:
+        return None
+    with open(filePath, encoding='UTF8') as f:
+        return f.read()
 
 def getpendingNewAccount(userId):
     filePath = f"data/{userId}/pendingNewAccount.json"
@@ -190,7 +205,6 @@ async def fetchGroups(client):
 
     return groups
 
-
 async def viewGroups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     userId = update.message.from_user.id
     accounts = getAccounts(userId)
@@ -225,7 +239,6 @@ async def viewGroups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
     client.disconnect()
 
-
 async def signInAndViewGroup(update, context) -> None:
     userId = update.message.from_user.id
     accounts = getAccounts(userId)
@@ -245,6 +258,24 @@ async def signInAndViewGroup(update, context) -> None:
     client.disconnect()
     await viewGroups(update, context)
 
+async def signInAndSendSMS(update, context) -> None:
+    userId = update.message.from_user.id
+    accounts = getAccounts(userId)
+    if accounts is None or len(accounts) == 0:
+        msg = "You've not added any account. Please /addAccount to continue"
+        await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+        return
+
+    account = accounts[0]
+    client = TelegramClient(
+        account["phoneNumber"], account["appApiId"], account["appApiHash"])
+    await client.connect()
+    phone_code_hash = getPhoneCodeHash(userId)
+    user = await client.sign_in(phone=account["phoneNumber"], code=update.message.text, phone_code_hash=phone_code_hash)
+    print(user)
+    saveCurrentOperation(userId, Operation.Nothing)
+    client.disconnect()
+    await sendSms(update, context)
 
 async def processChooseGroupToScrap(update, context) -> None:
     try:
@@ -309,6 +340,141 @@ async def processChooseGroupToScrap(update, context) -> None:
         msg = "Something went wrong, please enter the index number of the group that you want to scrap"
         await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
 
+async def sendSms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    userId = update.message.from_user.id
+    accounts = getAccounts(userId)
+    if accounts is None or len(accounts) == 0:
+        msg = "You've not added any account. Please /addAccount to continue"
+        await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+        return
+
+    account = accounts[0]
+    client = TelegramClient(
+        account["phoneNumber"], account["appApiId"], account["appApiHash"])
+    await client.connect()
+    if not await client.is_user_authorized():
+        resp = await client.send_code_request(account["phoneNumber"])
+        savePhoneCodeHash(userId, resp.phone_code_hash)
+        msg = "Enter your login code"
+        await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+        saveCurrentOperation(userId, Operation.SendSMS_send_code_request)
+        return
+
+    groups = await fetchGroups(client)
+
+    saveGroups(userId, groups)
+    msg = 'Choose a group to scrap members :'
+    saveCurrentOperation(userId, Operation.ChooseGroup_to_send_sms)
+    i = 0
+    for g in groups:
+        msg = f'{msg}\n[{i}] - {g.title}'
+        i += 1
+
+    msg = f'{msg}\n [+] Enter a Number : '
+    await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+    client.disconnect()
+
+async def processChooseGroupToSendSMS(update, context) -> None:
+    try:
+        userId = update.message.from_user.id
+        accounts = getAccounts(userId)
+        if accounts is None or len(accounts) == 0:
+            msg = "You've not added any account. Please /addAccount to continue"
+            await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+            return
+
+        account = accounts[0]
+        client = TelegramClient(
+            account["phoneNumber"], account["appApiId"], account["appApiHash"])
+        await client.connect()
+        msg = 'Fetching Group info...'
+        await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+        groups = await fetchGroups(client)
+
+        index = int(update.message.text)
+        if index < 0 or index >= len(groups):
+            msg = f"Invalid index. Please enter a number between 0 and {len(groups)-1}"
+            await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+
+        time.sleep(1)
+        target_group = groups[index]
+
+        input_file = f"data/members/{target_group.username}.csv"
+        saveCurrentMsgFileName(userId, input_file)
+        msg = '[+] Enter Your Message : '
+        await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+        saveCurrentOperation(userId, Operation.EnterMessage)
+        client.disconnect()
+    except Exception as e:
+        print(e)
+
+async def processEnterMessageToSendSMS(update, context) -> None:
+    try:
+        userId = update.message.from_user.id
+        input_file = getCurrentMsgFileName(userId)
+        if input_file is None:
+            sendSms(update, context)
+            return
+        
+        accounts = getAccounts(userId)
+        if accounts is None or len(accounts) == 0:
+            msg = "You've not added any account. Please /addAccount to continue"
+            await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+            return
+
+        account = accounts[0]
+        client = TelegramClient(
+            account["phoneNumber"], account["appApiId"], account["appApiHash"])
+        await client.connect()
+
+        users = []
+        with open(input_file, encoding='UTF-8') as f:
+            rows = csv.reader(f,delimiter=",",lineterminator="\n")
+            next(rows, None)
+            for row in rows:
+                user = {}
+                user['username'] = row[0]
+                user['id'] = int(row[1])
+                user['access_hash'] = int(row[2])
+                user['name'] = row[3]
+                users.append(user)
+        mode = 2
+        message = update.message.text
+
+        for user in users:
+            if mode == 2:
+                if user['username'] == "":
+                    continue
+                receiver = await client.get_input_entity(user['username'])
+            elif mode == 1:
+                receiver = InputPeerUser(user['id'],user['access_hash'])
+            else:
+                msg = "[!] Invalid Mode. Exiting."
+                client.disconnect()
+                await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+                return
+            try:
+                msg = "[+] Sending Message to: "+ user['name']
+                await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+                await client.send_message(receiver, message.format(user['name']))
+                msg = "[+] Waiting {} seconds".format(SLEEP_TIME)
+                await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+                time.sleep(SLEEP_TIME)
+            except PeerFloodError:
+                msg = "[!] Getting Flood Error from telegram. \n[!] Script is stopping now. \n[!] Please try again after some time."
+                await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+                client.disconnect()
+                return
+            except Exception as e:
+                print(re+"[!] Error:", e)
+                print(re+"[!] Trying to continue...")
+                continue
+        client.disconnect()
+        msg = 'Done. Message sent to all users.'
+        await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+    except Exception as e:
+        print(e)
+        return
 
 async def processResponse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     userId = update.message.from_user.id
@@ -328,8 +494,14 @@ async def processResponse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await viewAccounts(update, context)
     elif op == Operation.ViewGroup_send_code_request:
         await signInAndViewGroup(update, context)
+    elif op == Operation.SendSMS_send_code_request:
+        await signInAndSendSMS(update, context)
     elif op == Operation.ChooseGroup_to_scrap:
         await processChooseGroupToScrap(update, context)
+    elif op == Operation.ChooseGroup_to_send_sms:
+        await processChooseGroupToSendSMS(update, context)
+    elif op == Operation.EnterMessage:
+        await processEnterMessageToSendSMS(update, context)
 
 app = ApplicationBuilder().token(TOKEN).build()
 
@@ -341,6 +513,7 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("viewAccounts", viewAccounts))
 app.add_handler(CommandHandler("addAccount", addAccount))
 app.add_handler(CommandHandler("viewGroups", viewGroups))
+app.add_handler(CommandHandler("sendMessage", sendSms))
 
 print("bot is starting")
 app.run_polling()
